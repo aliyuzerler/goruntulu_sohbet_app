@@ -1,0 +1,102 @@
+name: randchat-dev
+
+# Use Postgres 16 + Redis 7 + MinIO latest stable.
+# These are the production-grade versions — kept consistent with prod.
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: randchat-pg
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-randchat}
+      POSTGRES_USER: ${POSTGRES_USER:-randchat}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-randchat}
+    ports:
+      - '5432:5432'
+    volumes:
+      - ./postgres/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+      - ./data/postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U ${POSTGRES_USER:-randchat}']
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    container_name: randchat-redis
+    restart: unless-stopped
+    command: ['redis-server', '--appendonly', 'yes']
+    ports:
+      - '6379:6379'
+    volumes:
+      - ./data/redis:/data
+    healthcheck:
+      test: ['CMD', 'redis-cli', 'ping']
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  minio:
+    image: minio/minio:latest
+    container_name: randchat-minio
+    restart: unless-stopped
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-randchat_minio}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-randchat_minio_secret_2024}
+    command: ['server', '/data', '--console-address', ':9001']
+    ports:
+      - '9000:9000' # S3 API
+      - '9001:9001' # Web console
+    volumes:
+      - ./data/minio:/data
+      - ./minio/init.sh:/etc/minio/init.sh:ro
+    healthcheck:
+      test: ['CMD', 'curl', '-f', 'http://localhost:9000/minio/health/live']
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Phase 3 will activate this; for now it just boots to verify the image.
+  socketio:
+    image: node:20-alpine
+    container_name: randchat-socketio
+    restart: unless-stopped
+    working_dir: /app
+    command: ['sh', '-c', 'node -e "const io=require(\"socket.io\")(3001,{cors:{origin:\"*\"}}); io.on(\"connection\",s=>{s.emit(\"hello\",\"randchat-dev\")}); console.log(\"socket.io listening on :3001\")"']
+    ports:
+      - '3001:3001'
+    depends_on:
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ['CMD', 'wget', '-qO-', 'http://localhost:3001/socket.io/?EIO=4&transport=polling']
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # MinIO bucket + policy bootstrap — runs once after MinIO boots.
+  minio-init:
+    image: minio/mc:latest
+    container_name: randchat-minio-init
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: ['/bin/sh', '/init.sh']
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-randchat_minio}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-randchat_minio_secret_2024}
+      MINIO_BUCKET: ${MINIO_BUCKET:-randchat-assets}
+    volumes:
+      - ./minio/init.sh:/init.sh:ro
+    restart: 'no'
+
+  # Postgres smoke test — verifies the DB is reachable before the API boots.
+  pg-isready:
+    image: postgres:16-alpine
+    container_name: randchat-pg-isready
+    depends_on:
+      postgres:
+        condition: service_healthy
+    entrypoint: ['sh', '-c', 'pg_isready -h postgres -U ${POSTGRES_USER:-randchat} && echo "PG ready"']
+    restart: 'no'

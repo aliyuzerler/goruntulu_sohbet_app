@@ -1,0 +1,2 @@
+-dontwarn io.flutter.embedding.**
+-keep class com.randchat.admin.MainActivity { *; }

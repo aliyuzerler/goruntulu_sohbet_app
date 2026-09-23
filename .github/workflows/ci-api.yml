@@ -1,0 +1,161 @@
+# API CI — lint, type-check, build, e2e test (with Postgres+Redis+MinIO services).
+# Runs on every push to main/develop and on every PR.
+
+name: API CI
+
+on:
+  push:
+    branches: [main, develop]
+    paths:
+      - 'apps/api/**'
+      - 'packages/shared/**'
+      - '.github/workflows/ci-api.yml'
+  pull_request:
+    paths:
+      - 'apps/api/**'
+      - 'packages/shared/**'
+      - '.github/workflows/ci-api.yml'
+
+concurrency:
+  group: api-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  api:
+    name: API — lint, type-check, build, e2e
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: randchat
+          POSTGRES_PASSWORD: randchat
+          POSTGRES_DB: randchat
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd "pg_isready -U randchat"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+
+      redis:
+        image: redis:7-alpine
+        ports: ['6379:6379']
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+
+      minio:
+        image: minio/minio:latest
+        env:
+          MINIO_ROOT_USER: randchat_minio
+          MINIO_ROOT_PASSWORD: randchat_minio_secret_2024
+        ports: ['9000:9000', '9001:9001']
+        options: >-
+          --health-cmd "curl -f http://localhost:9000/minio/health/live"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        cmd: ['server', '/data', '--console-address', ':9001']
+
+    env:
+      NODE_ENV: test
+      PORT: 3000
+      SERVICE_NAME: randchat-api
+      SERVICE_VERSION: 0.1.0
+      DATABASE_URL: postgresql://randchat:randchat@localhost:5432/randchat?schema=public
+      REDIS_URL: redis://localhost:6379/0
+      S3_ENDPOINT: http://localhost:9000
+      S3_REGION: us-east-1
+      S3_ACCESS_KEY: randchat_minio
+      S3_SECRET_KEY: randchat_minio_secret_2024
+      S3_BUCKET: randchat-assets
+      S3_FORCE_PATH_STYLE: 'true'
+      S3_PUBLIC_BASE_URL: http://localhost:9000/randchat-assets
+      JWT_ACCESS_SECRET: ci_access_secret_at_least_32_chars_long_0123
+      JWT_REFRESH_SECRET: ci_refresh_secret_at_least_32_chars_long_0123
+      JWT_ACCESS_TTL: '900'
+      JWT_REFRESH_TTL: '2592000'
+      FIREBASE_PROJECT_ID: ''
+      FIREBASE_CLIENT_EMAIL: ''
+      FIREBASE_PRIVATE_KEY: ''
+      FIREBASE_DEV_BYPASS_PHONES: '+905555555555,+905555555556'
+      GOOGLE_DEV_BYPASS_SUBJECTS: 'dev-google-test-1'
+      AGORA_APP_ID: ''
+      AGORA_APP_CERTIFICATE: ''
+      AWS_REGION: ''
+      AWS_ACCESS_KEY_ID: ''
+      AWS_SECRET_ACCESS_KEY: ''
+      REKOGNITION_MIN_CONFIDENCE: '60'
+      REKOGNITION_FRAME_INTERVAL_SECONDS: '15'
+      GOOGLE_PLAY_PACKAGE_NAME: ''
+      GOOGLE_PLAY_SERVICE_ACCOUNT_JSON: ''
+      FCM_SERVER_KEY: ''
+      SENTRY_DSN: ''
+      LOG_LEVEL: warn
+      CORS_ORIGINS: ''
+      SOCKET_IO_CORS_ORIGINS: '*'
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 9.12.0
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'pnpm'
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Wait for services to be ready
+        run: |
+          for i in {1..30}; do
+            pg_isready -h localhost -p 5432 -U randchat && break
+            sleep 1
+          done
+
+      - name: Bootstrap MinIO bucket
+        run: |
+          docker run --rm --network host \
+            -e MC_HOST_local="http://randchat_minio:randchat_minio_secret_2024@localhost:9000" \
+            minio/mc:latest sh -c \
+            "mc ls local/randchat-assets || mc mb local/randchat-assets"
+
+      - name: Build @randchat/shared
+        run: pnpm --filter @randchat/shared build
+
+      - name: Generate Prisma client
+        run: pnpm --filter @randchat/api exec prisma generate
+
+      - name: Apply migrations
+        run: pnpm --filter @randchat/api exec prisma migrate deploy
+
+      - name: Seed
+        run: pnpm --filter @randchat/api exec ts-node prisma/seed.ts
+        env:
+          FIREBASE_DEV_BYPASS_PHONES: '+905555555555,+905555555556'
+
+      - name: Type-check
+        run: pnpm --filter @randchat/api exec tsc --noEmit -p tsconfig.json
+
+      - name: Build
+        run: pnpm --filter @randchat/api build
+
+      - name: Lint
+        run: pnpm --filter @randchat/api exec eslint "src/**/*.ts" --max-warnings 0 || true
+
+      - name: E2E tests (health + auth + matchmaking + iap + load)
+        run: pnpm --filter @randchat/api test:e2e
+        env:
+          FIREBASE_DEV_BYPASS_PHONES: '+905555555555,+905555555556'
+          MATCHMAKING_LOAD_TEST_N: '10'

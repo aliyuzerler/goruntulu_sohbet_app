@@ -1,0 +1,332 @@
+{
+  "info": {
+    "name": "RandChat API — Phase 2",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json",
+    "description": "RandChat auth + profile + agreements + storage + me endpoints.\n\nDev bypass mode: when FIREBASE_PROJECT_ID is empty, the API accepts whitelisted phones\nwith any 6-digit OTP, and any string as Google idToken.\n\nVariables: apiBaseUrl, devBypassPhone, devGoogleToken — see Environments.",
+    "_postman_id": "randchat-phase2-collection"
+  },
+  "auth": {
+    "type": "bearer",
+    "bearer": [
+      { "key": "token", "value": "{{accessToken}}", "type": "string" }
+    ]
+  },
+  "variable": [
+    { "key": "apiBaseUrl", "value": "http://localhost:3000/api", "type": "string" },
+    { "key": "accessToken", "value": "", "type": "string" },
+    { "key": "refreshToken", "value": "", "type": "string" },
+    { "key": "devBypassPhone", "value": "+905555555555", "type": "string" },
+    { "key": "devGoogleToken", "value": "dev-google-idtoken-phase2", "type": "string" },
+    { "key": "testNickname", "value": "randchat_test_user", "type": "string" }
+  ],
+  "item": [
+    {
+      "name": "Health",
+      "item": [
+        {
+          "name": "GET /health",
+          "request": {
+            "auth": { "type": "noauth" },
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{apiBaseUrl}}/health",
+              "host": ["{{apiBaseUrl}}"],
+              "path": ["health"]
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "Auth",
+      "item": [
+        {
+          "name": "POST /auth/verify-phone (dev bypass)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "var json = pm.response.json();",
+                  "pm.collectionVariables.set('accessToken', json.accessToken);",
+                  "pm.collectionVariables.set('refreshToken', json.refreshToken);"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "auth": { "type": "noauth" },
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"idToken\": \"000000\",\n  \"phone\": \"{{devBypassPhone}}\",\n  \"androidId\": \"ci-android-id-1\",\n  \"fcmToken\": \"ci-fcm-token-1\",\n  \"appVersion\": \"0.1.0\"\n}"
+            },
+            "url": {
+              "raw": "{{apiBaseUrl}}/auth/verify-phone",
+              "host": ["{{apiBaseUrl}}"],
+              "path": ["auth", "verify-phone"]
+            }
+          }
+        },
+        {
+          "name": "POST /auth/verify-google (dev bypass)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "var json = pm.response.json();",
+                  "pm.collectionVariables.set('accessToken', json.accessToken);",
+                  "pm.collectionVariables.set('refreshToken', json.refreshToken);"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "auth": { "type": "noauth" },
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"idToken\": \"{{devGoogleToken}}\",\n  \"androidId\": \"ci-android-id-2\",\n  \"fcmToken\": \"ci-fcm-token-2\",\n  \"appVersion\": \"0.1.0\"\n}"
+            },
+            "url": {
+              "raw": "{{apiBaseUrl}}/auth/verify-google",
+              "host": ["{{apiBaseUrl}}"],
+              "path": ["auth", "verify-google"]
+            }
+          }
+        },
+        {
+          "name": "POST /auth/refresh",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "var json = pm.response.json();",
+                  "pm.collectionVariables.set('accessToken', json.accessToken);",
+                  "pm.collectionVariables.set('refreshToken', json.refreshToken);"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "auth": { "type": "noauth" },
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"refreshToken\": \"{{refreshToken}}\"\n}"
+            },
+            "url": {
+              "raw": "{{apiBaseUrl}}/auth/refresh",
+              "host": ["{{apiBaseUrl}}"],
+              "path": ["auth", "refresh"]
+            }
+          }
+        },
+        {
+          "name": "POST /auth/logout",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"refreshToken\": \"{{refreshToken}}\"\n}"
+            },
+            "url": {
+              "raw": "{{apiBaseUrl}}/auth/logout",
+              "host": ["{{apiBaseUrl}}"],
+              "path": ["auth", "logout"]
+            }
+          }
+        },
+        {
+          "name": "POST /auth/admin/login",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "var json = pm.response.json();",
+                  "pm.collectionVariables.set('accessToken', json.accessToken);"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "auth": { "type": "noauth" },
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"email\": \"admin@randchat.example\",\n  \"password\": \"admin-pass\"\n}"
+            },
+            "url": {
+              "raw": "{{apiBaseUrl}}/auth/admin/login",
+              "host": ["{{apiBaseUrl}}"],
+              "path": ["auth", "admin", "login"]
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "Me (auth required)",
+      "item": [
+        {
+          "name": "GET /me",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{apiBaseUrl}}/me",
+              "host": ["{{apiBaseUrl}}"],
+              "path": ["me"]
+            }
+          }
+        },
+        {
+          "name": "PATCH /me (complete profile)",
+          "request": {
+            "method": "PATCH",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"displayName\": \"{{testNickname}}\",\n  \"birthYear\": 1990,\n  \"gender\": \"MALE\",\n  \"country\": \"TR\",\n  \"bio\": \"Hello from Postman!\"\n}"
+            },
+            "url": {
+              "raw": "{{apiBaseUrl}}/me",
+              "host": ["{{apiBaseUrl}}"],
+              "path": ["me"]
+            }
+          }
+        },
+        {
+          "name": "POST /me/delete",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"reason\": \"Testing the deletion flow.\"\n}"
+            },
+            "url": {
+              "raw": "{{apiBaseUrl}}/me/delete",
+              "host": ["{{apiBaseUrl}}"],
+              "path": ["me", "delete"]
+            }
+          }
+        },
+        {
+          "name": "POST /me/delete/cancel",
+          "request": {
+            "method": "POST",
+            "header": [],
+            "url": {
+              "raw": "{{apiBaseUrl}}/me/delete/cancel",
+              "host": ["{{apiBaseUrl}}"],
+              "path": ["me", "delete", "cancel"]
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "Agreements",
+      "item": [
+        {
+          "name": "GET /agreements/latest",
+          "request": {
+            "auth": { "type": "noauth" },
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{apiBaseUrl}}/agreements/latest",
+              "host": ["{{apiBaseUrl}}"],
+              "path": ["agreements", "latest"]
+            }
+          }
+        },
+        {
+          "name": "POST /agreements/accept",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"agreementId\": \"<paste-from-get-latest>\"\n}"
+            },
+            "url": {
+              "raw": "{{apiBaseUrl}}/agreements/accept",
+              "host": ["{{apiBaseUrl}}"],
+              "path": ["agreements", "accept"]
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "Devices",
+      "item": [
+        {
+          "name": "POST /devices (register)",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"androidId\": \"postman-android-id\",\n  \"fcmToken\": \"postman-fcm-{{$randomInt}}\",\n  \"platform\": \"ANDROID\",\n  \"appVersion\": \"0.1.0\"\n}"
+            },
+            "url": {
+              "raw": "{{apiBaseUrl}}/devices",
+              "host": ["{{apiBaseUrl}}"],
+              "path": ["devices"]
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "Storage",
+      "item": [
+        {
+          "name": "POST /storage/presign-avatar",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"contentType\": \"image/jpeg\",\n  \"ext\": \"jpg\",\n  \"maxSizeBytes\": 524288\n}"
+            },
+            "url": {
+              "raw": "{{apiBaseUrl}}/storage/presign-avatar",
+              "host": ["{{apiBaseUrl}}"],
+              "path": ["storage", "presign-avatar"]
+            }
+          }
+        },
+        {
+          "name": "GET /storage/health",
+          "request": {
+            "auth": { "type": "noauth" },
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{apiBaseUrl}}/storage/health",
+              "host": ["{{apiBaseUrl}}"],
+              "path": ["storage", "health"]
+            }
+          }
+        }
+      ]
+    }
+  ]
+}

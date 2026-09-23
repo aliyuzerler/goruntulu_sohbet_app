@@ -1,0 +1,101 @@
+# Flutter CI — analyze + test for user_app and admin_app.
+# Runs on every push to main/develop and on every PR.
+# Phase 1: skeleton — no emulator. Phase 4+ may add integration tests.
+
+name: Flutter CI
+
+on:
+  push:
+    branches: [main, develop]
+    paths:
+      - 'apps/user_app/**'
+      - 'apps/admin_app/**'
+      - '.github/workflows/ci-flutter.yml'
+  pull_request:
+    paths:
+      - 'apps/user_app/**'
+      - 'apps/admin_app/**'
+      - '.github/workflows/ci-flutter.yml'
+
+concurrency:
+  group: flutter-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  user-app:
+    name: user_app — analyze + test (dev flavor)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    defaults:
+      run:
+        working-directory: apps/user_app
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.24.0'
+          channel: 'stable'
+          cache: true
+
+      - name: Flutter doctor
+        run: flutter doctor -v
+
+      - name: Install dependencies
+        run: flutter pub get
+
+      - name: Sync i18n (regenerate tr.dart/en.dart from JSON)
+        run: dart run scripts/sync_i18n.dart
+
+      - name: Analyze
+        run: flutter analyze --no-pub
+
+      - name: Test (smoke + i18n completeness + wallet DTO)
+        run: flutter test --no-pub --coverage --coverage-path=coverage/lcov.info
+
+      - name: Verify dev flavor compiles
+        run: flutter build apk --flavor dev --debug -t lib/main/main_dev.dart --no-pub
+
+      - name: Upload coverage
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: user_app-coverage
+          path: apps/user_app/coverage/
+
+  admin-app:
+    name: admin_app — analyze + test
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    defaults:
+      run:
+        working-directory: apps/admin_app
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.24.0'
+          channel: 'stable'
+          cache: true
+
+      - name: Flutter doctor
+        run: flutter doctor -v
+
+      - name: Install dependencies
+        run: flutter pub get
+
+      - name: Analyze
+        run: flutter analyze --no-pub
+
+      - name: Test
+        run: flutter test --no-pub
+
+      - name: Verify debug build compiles
+        run: flutter build apk --debug --no-pub

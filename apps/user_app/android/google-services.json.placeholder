@@ -1,0 +1,6 @@
+{
+  // Mock for Phase 1. Phase 2 will wire real google-services.json from Firebase.
+  // This file exists so that the build doesn't fail on missing plugin configs
+  // (Flutter's Gradle step expects it). Replace before going to prod.
+  "_placeholder": "randchat user_app placeholder google-services.json — Phase 2 will replace."
+}

@@ -1,0 +1,89 @@
+name: randchat_user_app
+description: "RandChat — random video chat. User app (Phase 1 scaffold)."
+publish_to: 'none'
+version: 0.1.0+1
+
+environment:
+  sdk: '>=3.5.0 <4.0.0'
+  flutter: '>=3.24.0'
+
+dependencies:
+  flutter:
+    sdk: flutter
+  flutter_localizations:
+    sdk: flutter
+
+  # State management
+  riverpod: ^2.5.1
+  flutter_riverpod: ^2.5.1
+
+  # Routing
+  go_router: ^14.2.7
+
+  # Network
+  dio: ^5.7.0
+
+  # WebSocket client — Phase 3.
+  socket_io_client: ^3.0.0
+
+  # Video — Phase 4. Agora RTC SDK.
+  agora_rtc_engine: ^6.3.0
+  # Permission handler — runtime camera + mic permission requests.
+  permission_handler: ^11.3.1
+  # Wakelock — keep screen on during a call.
+  wakelock_plus: ^1.2.8
+  # Phase 6: in-app purchases (Google Play Billing consumable).
+  in_app_purchase: ^3.2.0
+  # Phase 9: url launcher (forced update → Play Store link).
+  url_launcher: ^6.3.0
+
+  # Auth — Phase 2. firebase_auth + google_sign_in. In dev bypass mode, the
+  # user can also enter a phone number directly and we accept any OTP —
+  # useful for CI + local testing without a Firebase project.
+  firebase_auth: ^5.3.0
+  google_sign_in: ^6.2.1
+
+  # Secure storage for JWT refresh token + access token.
+  flutter_secure_storage: ^9.2.2
+
+  # Image picker for avatar upload.
+  image_picker: ^1.1.2
+
+  # Country picker for profile setup.
+  country_picker: ^2.0.27
+
+  # intl for date formatting in delete-account countdown.
+  intl: ^0.19.0
+
+  # Models / immutability
+  freezed_annotation: ^2.4.4
+  json_annotation: ^4.9.0
+
+  # i18n — manual for Phase 1; Phase 7 may switch to slang + codegen.
+
+  # Logging
+  logger: ^2.4.0
+
+  # Async / utility
+  fpdart: ^1.1.0
+
+  # UI
+  cupertino_icons: ^1.0.8
+  google_fonts: ^6.2.1
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^4.0.0
+
+  # Codegen (Phase 2+ — not needed for Phase 1 scaffold)
+  build_runner: ^2.4.13
+  freezed: ^2.5.7
+  json_serializable: ^6.8.0
+
+flutter:
+  uses-material-design: true
+  generate: true
+  assets:
+    - assets/images/
+    - lib/i18n/

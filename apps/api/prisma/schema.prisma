@@ -1,0 +1,762 @@
+// Prisma schema for RandChat — Faz 2 complete schema.
+// All server-side authoritative fields (Wallet.balance, role, etc.) are
+// only writable through API routes — never trust client-supplied values.
+
+generator client {
+  provider = "prisma-client-js"
+  // Default output — works correctly with pnpm's symlinked @prisma/client.
+  // Do NOT override `output` unless you know how to make pnpm resolve it.
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// AUTH & USERS
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Core user account — created on first Firebase phone OTP / Google Sign-In.
+/// `firebaseUid` is the bridge to Firebase Auth; we never store passwords here.
+/// `firebasePhone` (E.164) is unique per user so one phone = one account.
+model User {
+  id            String     @id @default(uuid()) @db.Uuid
+  firebaseUid   String     @unique @db.VarChar(128)
+  /// E.164 phone used for OTP login — null for Google-only users.
+  firebasePhone String?    @unique @db.VarChar(20) @map("firebase_phone")
+  /// Google subject ID — null for phone-only users.
+  googleSubject String?    @unique @db.VarChar(128) @map("google_subject")
+  role          UserRole   @default(USER)
+  status        UserStatus @default(ACTIVE)
+  /// Profile setup completed? Gates whether user can match.
+  profileCompleted Boolean @default(false) @map("profile_completed")
+  createdAt     DateTime   @default(now()) @map("created_at")
+  updatedAt     DateTime   @updatedAt @map("updated_at")
+  lastSeenAt    DateTime?  @map("last_seen_at")
+
+  profile          Profile?
+  wallet           Wallet?
+  devices          Device[]
+  refreshTokens    RefreshToken[]
+  agreementAcceptances UserAgreement[]
+  deletionRequest  DeletionRequest?
+  /// Phase 6: Google Play IAP purchases — one row per verified purchase.
+  purchases        Purchase[]
+  /// Phase 7: VIP subscription entitlement (one row per user, upserted on verify).
+  entitlement      Entitlement?
+  /// Phase 7: active paid filter activations (e.g. country filter for 24h).
+  filterActivations FilterActivation[]
+  /// Phase 8: moderation frames captured from this user's video.
+  moderationFrames ModerationFrame[]
+  /// Phase 8: strike counter (one row per user, upserted on apply).
+  strike          Strike?
+  /// Phase 8: ratings this user gave (as rater).
+  ratingsGiven    CallRating[] @relation("CallRatingRater")
+  /// Phase 8: ratings this user received (as target).
+  ratingsReceived CallRating[] @relation("CallRatingTarget")
+  /// Phase 8: chat messages sent in calls.
+  chatMessages    CallChatMessage[] @relation("ChatMessageSender")
+  /// Phase 11: daily login streak (one row per user).
+  dailyLoginStreak  DailyLoginStreak?
+  /// Phase 11: referrals where this user is the referrer.
+  referralsMade    Referral[] @relation("ReferralReferrer")
+  /// Phase 11: referrals where this user is the invitee.
+  referralsReceived Referral[] @relation("ReferralInvitee")
+  callsAsCaller    Call[]    @relation("CallCaller")
+  callsAsCallee    Call[]    @relation("CallCallee")
+  reportsMade      Report[]  @relation("ReportReporter")
+  reportsReceived  Report[]  @relation("ReportReported")
+  blocksInitiated  Block[]   @relation("BlockBlocker")
+  blocksReceived   Block[]   @relation("BlockBlocked")
+
+  /// Phase 1 health check audit row — keeps the e2e test happy.
+  healthPings      HealthPing[]
+
+  @@index([status])
+  @@index([role])
+  @@map("users")
+}
+
+/// User display info — 1:1 with User. Kept separate so auth lookups
+/// don't pull avatar/bio into memory every request.
+model Profile {
+  id           String    @id @default(uuid()) @db.Uuid
+  userId       String    @unique @db.Uuid
+  user         User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  /// Public nickname — unique, profanity-filtered.
+  displayName  String    @unique @db.VarChar(40)
+  avatarUrl    String?   @db.VarChar(512)
+  bio          String?   @db.Text
+  gender       Gender    @default(UNSPECIFIED)
+  country      String?   @db.VarChar(2) // ISO 3166-1 alpha-2
+  /// Birth year (4-digit) — used for 18+ check only. We don't store full DOB.
+  birthYear    Int?      @map("birth_year")
+  createdAt    DateTime  @default(now()) @map("created_at")
+  updatedAt    DateTime  @updatedAt @map("updated_at")
+
+  @@map("profiles")
+}
+
+enum UserRole {
+  USER
+  MODERATOR
+  ADMIN
+}
+
+enum UserStatus {
+  ACTIVE
+  SHADOW // soft-ban: can use app but actions are silently flagged
+  BANNED
+}
+
+enum Gender {
+  MALE
+  FEMALE
+  OTHER
+  UNSPECIFIED
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ECONOMY — server-authoritative, append-only ledger
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Wallet — single source of truth for coin balance. Only server writes.
+/// `version` is for optimistic locking; concurrently issued transactions
+/// must not silently overwrite each other.
+model Wallet {
+  id        String   @id @default(uuid()) @db.Uuid
+  userId    String   @unique @db.Uuid
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  /// Current balance. Always updated in the same tx as a CoinTransaction row
+  /// (snapshot pattern). Use Int — coin amounts fit in 4-byte integer.
+  balance   Int      @default(0)
+  /// Optimistic lock version — incremented on every balance change.
+  version   Int      @default(0)
+  /// Phase 6: true if a RTDN refund pushed balance below 0 (negative ledger).
+  /// User can still spend (we don't block) but admin KPI flags them.
+  negativeBalance Boolean @default(false) @map("negative_balance")
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  transactions CoinTransaction[]
+
+  @@map("wallets")
+}
+
+/// CoinTransaction — append-only ledger entry.
+/// NEVER UPDATED OR DELETED. Any "correction" is a new row with type=ADJUSTMENT.
+/// Idempotency: (walletId, idempotencyKey) is unique — duplicate requests
+/// return the same row without creating a new one.
+model CoinTransaction {
+  id             String        @id @default(uuid()) @db.Uuid
+  walletId       String        @db.Uuid
+  wallet         Wallet        @relation(fields: [walletId], references: [id], onDelete: Cascade)
+  type           CoinTxType
+  /// Positive for credit (purchase, refund), negative for debit (spend).
+  amount         Int
+  /// Snapshot of wallet balance AFTER this tx applied — for audit/debugging.
+  balanceAfter   Int
+  /// Idempotency key from client or upstream service (Google Play purchase token,
+  /// match ID, etc.). Unique per wallet so duplicates don't double-spend.
+  idempotencyKey String        @map("idempotency_key") @db.VarChar(128)
+  /// Optional reference (purchase token, call ID, gift recipient, etc.)
+  reference      String?      @db.VarChar(256)
+  createdAt      DateTime      @default(now()) @map("created_at")
+
+  @@unique([walletId, idempotencyKey], map: "coin_tx_idempotency_unique")
+  @@index([walletId, createdAt])
+  @@index([type])
+  @@map("coin_transactions")
+}
+
+enum CoinTxType {
+  PURCHASE       // Google Play → user buys coins
+  SPEND_MATCH    // Random match fee
+  SPEND_GIFT     // Gift to other user
+  SPEND_FILTER   // Gender/region filter
+  REFUND         // Refund from dispute or system error
+  ADJUSTMENT     // Manual admin adjustment
+}
+
+/// Phase 6 — Purchase record from Google Play Billing.
+/// `orderId` is unique — same token can't be processed twice (idempotency).
+/// `purchaseToken` is unique too — used for RTDN webhook correlation.
+model Purchase {
+  id              String   @id @default(uuid()) @db.Uuid
+  userId          String   @db.Uuid
+  user            User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  /// Google Play order ID — unique per purchase transaction.
+  orderId         String   @unique @db.VarChar(128) @map("order_id")
+  /// Product ID — matches Play Console SKUs (coin_pack_small/medium/large/mega).
+  productId       String   @db.VarChar(64) @map("product_id")
+  /// Raw purchase token from Google Play — used to look up the purchase via
+  /// the Play Developer API + to receive RTDN push notifications.
+  purchaseToken   String   @unique @db.VarChar(512) @map("purchase_token")
+  /// Number of coins credited to the wallet on success.
+  coinsCredited   Int      @map("coins_credited")
+  /// Price paid in micros (1.000.000 = 1 unit). Used for revenue reporting.
+  amountMicros    Int?     @map("amount_micros")
+  /// ISO 4217 currency code (e.g. "TRY", "USD").
+  currency        String?  @db.VarChar(3)
+  /// State: PENDING | PURCHASED | CANCELED | REFUNDED | VOIDED.
+  purchaseState   String   @map("purchase_state") @db.VarChar(32)
+  /// Set when RTDN REFUNDED arrives — jetons were debited back.
+  refundedAt      DateTime? @map("refunded_at")
+  /// Set when RTDN VOIDED arrives — purchase was revoked.
+  voidedAt        DateTime? @map("voided_at")
+  /// Phase 6: raw RTDN payload (JSON) for audit.
+  lastRtdnPayload Json?    @map("last_rtdn_payload")
+  createdAt       DateTime @default(now()) @map("created_at")
+  updatedAt       DateTime @updatedAt @map("updated_at")
+
+  @@index([userId, createdAt])
+  @@index([productId])
+  @@map("purchases")
+}
+
+// ─────────────────────────────────────────────────────────────────────────────────────
+// VIP + FILTERS (Phase 7)
+// ─────────────────────────────────────────────────────────────────────────────────────
+
+/// Entitlement — one row per user, upserted on verify-subscription.
+/// Tracks whether the user currently has VIP status (gender filter + free country filter).
+///
+/// Lifecycle:
+///   ACTIVE    → user has paid + Google Play says subscription is alive
+///   CANCELED  → user canceled but is still within their paid period (cancel effective at next billing)
+///   EXPIRED   → subscription lapsed (no renewal)
+///   GRACE     → billing retry period (Google is trying to charge the card)
+///
+/// `expiresAt` is the canonical truth — even if status=CANCELED, user keeps VIP until expiresAt.
+/// Matchmaking checks `isActive()` = status in (ACTIVE, CANCELED, GRACE) AND expiresAt > now.
+model Entitlement {
+  id              String   @id @default(uuid()) @db.Uuid
+  userId          String   @unique @db.Uuid
+  user            User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  /// Google Play subscription purchase token (for RTDN lookup).
+  purchaseToken   String   @unique @map("purchase_token") @db.VarChar(512)
+  /// Product ID from Play Console (e.g. vip_monthly).
+  productId       String   @map("product_id") @db.VarChar(64)
+  /// ACTIVE | CANCELED | EXPIRED | GRACE
+  status          String   @db.VarChar(16)
+  /// When the current billing period ends. VIP stays active until this date.
+  expiresAt       DateTime @map("expires_at")
+  /// Set when RTDN SUBSCRIPTION_CANCELED arrives.
+  canceledAt      DateTime? @map("canceled_at")
+  /// Set when RTDN SUBSCRIPTION_EXPIRED arrives.
+  expiredAt       DateTime? @map("expired_at")
+  /// Set when RTDN SUBSCRIPTION_GRACE_PERIOD_ENDS / RENEWED arrives.
+  lastRtdnAt      DateTime? @map("last_rtdn_at")
+  lastRtdnPayload Json?    @map("last_rtdn_payload")
+  createdAt       DateTime @default(now()) @map("created_at")
+  updatedAt       DateTime @updatedAt @map("updated_at")
+
+  @@index([status, expiresAt])
+  @@map("entitlements")
+}
+
+/// FilterActivation — paid or VIP-granted filter activation.
+/// Phase 7: country filter (20 coins / 24h OR free for VIP).
+/// Gender filter doesn't need a row — it's gated by Entitlement.isActive().
+///
+/// One row per (user, type) — upserted on activate. Expire auto via expiresAt.
+model FilterActivation {
+  id           String   @id @default(uuid()) @db.Uuid
+  userId       String   @db.Uuid
+  user         User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  /// COUNTRY (Phase 7). Phase 8 may add GENDER_BACKUP, REGION, etc.
+  type         String   @db.VarChar(16)
+  /// For COUNTRY: ISO 3166-1 alpha-2 country code ("TR", "US", "DE"...)
+  /// For other types: type-specific value.
+  value        String   @db.VarChar(8)
+  /// When this activation expires (now + 24h for country filter).
+  expiresAt    DateTime @map("expires_at")
+  /// 0 for VIP users (free), 20 for paid users (coin cost).
+  coinsSpent   Int      @default(0) @map("coins_spent")
+  /// True if this was granted by VIP status (no coin charged).
+  isVipGrant   Boolean  @default(false) @map("is_vip_grant")
+  createdAt    DateTime @default(now()) @map("created_at")
+
+  /// Only one active filter of each (userId, type) — upsert pattern.
+  @@unique([userId, type], map: "filter_activation_user_type_unique")
+  @@index([expiresAt])
+  @@map("filter_activations")
+}
+
+// ─────────────────────────────────────────────────────────────────────────────────────
+// DEVICES & PRESENCE
+// ─────────────────────────────────────────────────────────────────────────────────────
+
+/// Device — one per (user, androidId). FCM token can change on re-install,
+/// so we update the row instead of creating a new one.
+/// Single active session per device: when a new refresh token is issued
+/// for (userId, androidId), all previous refresh tokens for that device
+/// are revoked.
+model Device {
+  id           String    @id @default(uuid()) @db.Uuid
+  userId       String    @db.Uuid
+  user         User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  /// Android ID — unique per (install, signing key). Null for iOS (no equivalent).
+  androidId    String?   @db.VarChar(64) @map("android_id")
+  fcmToken     String    @unique @db.VarChar(256)
+  platform     Platform
+  appVersion   String?   @db.VarChar(32)
+  lastSeenAt   DateTime  @default(now()) @map("last_seen_at")
+  createdAt    DateTime  @default(now()) @map("created_at")
+
+  refreshTokens RefreshToken[]
+
+  /// (userId, androidId) must be unique — single row per device per user.
+  @@unique([userId, androidId], map: "device_user_android_unique")
+  @@index([userId])
+  @@map("devices")
+}
+
+enum Platform {
+  ANDROID
+  IOS
+  WEB
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// AUTH — refresh tokens, agreements, deletion requests
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// RefreshToken — opaque refresh token (random 32 bytes, hashed at rest).
+/// Each refresh issues a new token in the same `familyId` chain. Reuse of a
+/// revoked token revokes the entire family (token stealing detection).
+model RefreshToken {
+  id           String    @id @default(uuid()) @db.Uuid
+  userId       String    @db.Uuid
+  user         User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  /// SHA-256 hex of the opaque refresh token (never store the raw token).
+  tokenHash    String    @unique @db.VarChar(128) @map("token_hash")
+  /// Family chain — same UUID across rotations; reuse detection group.
+  familyId     String    @db.Uuid @map("family_id")
+  deviceId     String?   @db.Uuid @map("device_id")
+  device       Device?   @relation(fields: [deviceId], references: [id], onDelete: SetNull)
+  expiresAt    DateTime   @map("expires_at")
+  /// Null = active. Once revoked (rotation or logout or family-revoke).
+  revokedAt    DateTime?  @map("revoked_at")
+  /// Next token in chain — set when rotated. For audit trail.
+  replacedById String?   @db.Uuid @map("replaced_by_id")
+  /// IP that issued/rotated this token — for forensic review.
+  issuedFromIp String?   @db.VarChar(45) @map("issued_from_ip")
+  createdAt    DateTime  @default(now()) @map("created_at")
+
+  @@index([userId])
+  @@index([familyId])
+  @@index([expiresAt])
+  @@map("refresh_tokens")
+}
+
+/// Agreement — versioned terms/privacy text. Published versions are immutable.
+/// New version requires user re-acceptance before they can use the app.
+model Agreement {
+  id           String         @id @default(uuid()) @db.Uuid
+  type         AgreementType
+  version      String         @db.VarChar(20) // semver, e.g. "1.0.0"
+  bodyMd       String         @map("body_md") @db.Text
+  publishedAt  DateTime       @default(now()) @map("published_at")
+  archivedAt   DateTime?      @map("archived_at")
+  acceptances  UserAgreement[]
+
+  @@unique([type, version], map: "agreement_type_version_unique")
+  @@index([type, publishedAt])
+  @@map("agreements")
+}
+
+enum AgreementType {
+  TERMS
+  PRIVACY
+}
+
+/// UserAgreement — append-only acceptance record. Used for legal compliance.
+model UserAgreement {
+  id           String    @id @default(uuid()) @db.Uuid
+  userId       String    @db.Uuid
+  user         User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  agreementId  String    @db.Uuid
+  agreement    Agreement @relation(fields: [agreementId], references: [id])
+  /// Snapshot of the agreement version at accept time (immutable for audit).
+  versionSnapshot String  @map("version_snapshot") @db.VarChar(20)
+  acceptedAt   DateTime  @default(now()) @map("accepted_at")
+  /// IP that accepted — for legal audit.
+  acceptedFromIp String? @db.VarChar(45) @map("accepted_from_ip")
+
+  @@unique([userId, agreementId], map: "user_agreement_unique")
+  @@index([userId])
+  @@map("user_agreements")
+}
+
+/// DeletionRequest — 14-day grace period before account anonymization.
+/// User can cancel within grace period; after `scheduledAt` the cron job
+/// anonymizes the account (PII nulled, profile cleared, refresh tokens revoked).
+model DeletionRequest {
+  id           String    @id @default(uuid()) @db.Uuid
+  userId       String    @unique @db.Uuid
+  user         User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  requestedAt  DateTime  @default(now()) @map("requested_at")
+  /// requestedAt + 14 days — when the cron should anonymize.
+  scheduledAt  DateTime  @map("scheduled_at")
+  /// Set when the anonymization cron actually ran.
+  executedAt   DateTime? @map("executed_at")
+  /// Set if user canceled within grace period.
+  canceledAt   DateTime? @map("canceled_at")
+  reason       String?   @db.Text
+
+  @@index([scheduledAt, executedAt, canceledAt])
+  @@map("deletion_requests")
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// CALLS & MODERATION
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Call — single video session between two users.
+model Call {
+  id            String      @id @default(uuid()) @db.Uuid
+  callerId      String      @db.Uuid
+  caller        User        @relation("CallCaller", fields: [callerId], references: [id])
+  calleeId      String      @db.Uuid
+  callee        User        @relation("CallCallee", fields: [calleeId], references: [id])
+  /// Agora RTC channel name — unique so two calls can't collide.
+  agoraChannel  String      @unique @map("agora_channel") @db.VarChar(128)
+  status        CallStatus
+  startedAt     DateTime    @default(now()) @map("started_at")
+  endedAt       DateTime?   @map("ended_at")
+  /// Computed when call ends (seconds). Null if call never connected.
+  durationSec   Int?        @map("duration_sec")
+  /// Phase 5: why the call ended — used for admin KPIs.
+  endReason     String?    @map("end_reason") @db.VarChar(32)
+  /// Phase 5: average network RTT (ms) during the call — for quality KPIs.
+  avgQualityMs  Int?        @map("avg_quality_ms")
+
+  reports       Report[]
+  /// Phase 8: moderation frames captured during this call.
+  moderationFrames ModerationFrame[]
+  /// Phase 8: post-call ratings (one per (call, rater)).
+  ratings      CallRating[]
+  /// Phase 8: in-call text chat messages.
+  chatMessages CallChatMessage[]
+
+  @@index([callerId, startedAt])
+  @@index([calleeId, startedAt])
+  @@index([status])
+  @@index([endReason])
+  @@map("calls")
+}
+
+enum CallStatus {
+  WAITING    // In matchmaking queue
+  MATCHED    // Paired but not connected (was "RINGING" — same meaning)
+  ACTIVE     // Video stream up
+  ENDED      // Normally ended
+  REPORTED   // Flagged for moderation review
+}
+
+/// Report — one user reports another (optionally tied to a call).
+model Report {
+  id           String        @id @default(uuid()) @db.Uuid
+  reporterId   String        @db.Uuid
+  reporter     User          @relation("ReportReporter", fields: [reporterId], references: [id])
+  reportedId   String        @db.Uuid
+  reported     User          @relation("ReportReported", fields: [reportedId], references: [id])
+  callId       String?       @db.Uuid
+  call         Call?         @relation(fields: [callId], references: [id], onDelete: SetNull)
+  reason       ReportReason
+  details      String?       @db.Text
+  status       ReportStatus  @default(PENDING)
+  resolvedById String?       @db.Uuid @map("resolved_by_id")
+  resolvedBy   AdminUser?   @relation("ReportResolver", fields: [resolvedById], references: [id], onDelete: SetNull)
+  resolvedAt   DateTime?     @map("resolved_at")
+  createdAt    DateTime      @default(now()) @map("created_at")
+
+  @@index([reportedId, status])
+  @@index([status, createdAt])
+  @@map("reports")
+}
+
+enum ReportReason {
+  INAPPROPRIATE
+  HARASSMENT
+  SPAM
+  MINOR
+  OTHER
+}
+
+enum ReportStatus {
+  PENDING
+  REVIEWING
+  RESOLVED
+  DISMISSED
+}
+
+/// Block — one user blocks another. Matchmaking must exclude pairs where
+/// either side has blocked the other.
+model Block {
+  id         String   @id @default(uuid()) @db.Uuid
+  blockerId  String   @db.Uuid
+  blocker    User     @relation("BlockBlocker", fields: [blockerId], references: [id], onDelete: Cascade)
+  blockedId  String   @db.Uuid
+  blocked    User     @relation("BlockBlocked", fields: [blockedId], references: [id], onDelete: Cascade)
+  createdAt  DateTime @default(now()) @map("created_at")
+
+  @@unique([blockerId, blockedId], map: "block_pair_unique")
+  @@index([blockedId])
+  @@map("blocks")
+}
+
+// ─────────────────────────────────────────────────────────────────────────────────────
+// MODERATION (Phase 8)
+// ─────────────────────────────────────────────────────────────────────────────────────
+
+/// ModerationFrame — captured video frame during a call, scanned by AWS Rekognition.
+/// One row per (callId, captureSeq). The Rekognition response is stored as JSON for audit.
+///
+/// Flow:
+///   1. Client captures a frame every 15s during a call.
+///   2. POST /api/moderation/capture-frame { callId, frameBase64 }
+///   3. Server uploads to S3 (moderation/<callId>/<seq>.jpg).
+///   4. Server calls Rekognition ModerateLabels on the frame.
+///   5. If any NSFW label confidence > threshold → endCall + applyStrike + createReport.
+///   6. ModerationFrame row created with s3Key + rekognition result.
+model ModerationFrame {
+  id              String   @id @default(uuid()) @db.Uuid
+  callId          String   @db.Uuid @map("call_id")
+  call            Call     @relation(fields: [callId], references: [id], onDelete: Cascade)
+  /// The user whose frame was captured (one of the two participants).
+  userId          String   @db.Uuid @map("user_id")
+  user            User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  /// Monotonic sequence number per call — used for "last 3 frames" evidence.
+  captureSeq      Int      @map("capture_seq")
+  s3Key           String   @map("s3_key") @db.VarChar(512)
+  /// True if any Rekognition label was above the NSFW threshold.
+  flagged         Boolean  @default(false)
+  /// Raw Rekognition response (JSON) — for audit + admin dashboard.
+  rekognitionResult Json?  @map("rekognition_result")
+  capturedAt      DateTime @default(now()) @map("captured_at")
+
+  @@unique([callId, captureSeq], map: "moderation_frame_call_seq_unique")
+  @@index([userId, capturedAt])
+  @@index([flagged])
+  @@map("moderation_frames")
+}
+
+/// Strike — per-user strike counter for moderation violations.
+///
+/// Levels (configurable via env):
+///   0 → no strikes
+///   1 → warning (call ends, user notified)
+///   2 → 24h cooldown (cannot match for STRIKE_COOLDOWN_HOURS)
+///   3+ → permanent ban (status=BANNED, no auth)
+///
+/// Special case: MINOR (underage suspicion) report reason → instant ban + manual review.
+/// lastStrikeAt + expiresAt used for cooldown enforcement.
+model Strike {
+  id           String    @id @default(uuid()) @db.Uuid
+  userId       String    @unique @db.Uuid
+  user         User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  /// Current strike level — 0, 1, 2, 3, ...
+  level        Int       @default(0)
+  /// Last strike applied at — used for "decay" policy (Phase 9 may decay after 30d).
+  lastStrikeAt DateTime? @map("last_strike_at")
+  /// If level == 2 (cooldown), this is when the cooldown expires.
+  cooldownEndsAt DateTime? @map("cooldown_ends_at")
+  /// Reason for the latest strike — for audit.
+  lastReason   String?   @map("last_reason") @db.VarChar(64)
+  createdAt    DateTime  @default(now()) @map("created_at")
+  updatedAt    DateTime  @updatedAt @map("updated_at")
+
+  @@index([cooldownEndsAt])
+  @@map("strikes")
+}
+
+/// CallRating — 1-5 star rating submitted after a call ends.
+/// (callId, raterId) is unique — one rating per (call, rater) pair.
+/// targetUserId is the OTHER participant — used to compute avg rating → queue priority.
+model CallRating {
+  id            String   @id @default(uuid()) @db.Uuid
+  callId        String   @db.Uuid @map("call_id")
+  call          Call     @relation(fields: [callId], references: [id], onDelete: Cascade)
+  raterId       String   @db.Uuid @map("rater_id")
+  rater         User     @relation("CallRatingRater", fields: [raterId], references: [id], onDelete: Cascade)
+  targetUserId  String   @db.Uuid @map("target_user_id")
+  targetUser    User     @relation("CallRatingTarget", fields: [targetUserId], references: [id], onDelete: Cascade)
+  /// 1-5 stars.
+  stars         Int
+  createdAt     DateTime @default(now()) @map("created_at")
+
+  @@unique([callId, raterId], map: "call_rating_call_rater_unique")
+  @@index([targetUserId])
+  @@map("call_ratings")
+}
+
+/// CallChatMessage — in-call text chat. Filtered by ChatFilterService before persist.
+/// Filtered messages are stored with `filtered=true` + the original (redacted) content.
+/// Blocked messages (link spam) are NOT stored — just counted for strike accumulation.
+model CallChatMessage {
+  id         String   @id @default(uuid()) @db.Uuid
+  callId     String   @db.Uuid @map("call_id")
+  call       Call     @relation(fields: [callId], references: [id], onDelete: Cascade)
+  senderId   String   @db.Uuid @map("sender_id")
+  sender     User     @relation("ChatMessageSender", fields: [senderId], references: [id], onDelete: Cascade)
+  /// The (possibly filtered) text — profanity replaced with ***.
+  content    String   @db.Text
+  /// True if the content was modified by the profanity filter.
+  filtered   Boolean  @default(false)
+  createdAt  DateTime @default(now()) @map("created_at")
+
+  @@index([callId, createdAt])
+  @@index([senderId])
+  @@map("call_chat_messages")
+}
+
+// ─────────────────────────────────────────────────────────────────────────────────────
+// BAN EVASION (Phase 9) — block banned users from creating new accounts
+// ─────────────────────────────────────────────────────────────────────────────────────
+
+/// BannedDevice — when a user is banned, we store their androidId + phone hash
+/// so that a new signup from the same device OR phone is rejected (ban evasion prevention).
+///
+/// Phase 9: BAN_EVASION_ENABLED env gates this. If false, signup doesn't check.
+///
+/// One row per banned user. (androidId, phoneHash) combination unique.
+model BannedDevice {
+  id              String   @id @default(uuid()) @db.Uuid
+  /// SHA-256 of the phone number (E.164) — never store the raw phone here.
+  phoneHash       String   @map("phone_hash") @db.VarChar(128)
+  /// Android ID (per-app-install identifier) — null for iOS.
+  androidId       String?  @map("android_id") @db.VarChar(64)
+  /// The original userId that was banned — for audit traceability.
+  originalUserId  String   @map("original_user_id") @db.Uuid
+  bannedAt        DateTime @default(now()) @map("banned_at")
+
+  /// One banned device per (phoneHash, androidId) combination.
+  @@unique([phoneHash, androidId], map: "banned_device_pair_unique")
+  @@index([phoneHash])
+  @@index([androidId])
+  @@map("banned_devices")
+}
+
+// ─────────────────────────────────────────────────────────────────────────────────────
+// RETENTION + MONETIZATION EXTRAS (Phase 11)
+// ─────────────────────────────────────────────────────────────────────────────────────
+
+/// DailyLoginStreak — tracks the user's 7-day login streak.
+/// One row per user (upserted on each claim).
+/// Streak resets if the user skips a day.
+///
+/// Rewards: env-driven comma-separated list (default "1,2,3,4,5,5,5").
+///   Day 1: 1 coin, Day 2: 2, ..., Day 5+: 5 coins.
+model DailyLoginStreak {
+  id              String   @id @default(uuid()) @db.Uuid
+  userId          String   @unique @db.Uuid
+  user            User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  /// Current streak length (1-7). Resets to 0 if a day is skipped.
+  currentStreak   Int      @default(0) @map("current_streak")
+  /// Total coins earned from daily login (lifetime).
+  totalEarned     Int      @default(0) @map("total_earned")
+  /// The date (YYYY-MM-DD UTC) of the last claim — used to compute "is today already claimed" + "streak break".
+  lastClaimDate   String?  @map("last_claim_date") @db.VarChar(10)
+  lastClaimAt     DateTime? @map("last_claim_at")
+  createdAt       DateTime @default(now()) @map("created_at")
+  updatedAt       DateTime @updatedAt @map("updated_at")
+
+  @@map("daily_login_streaks")
+}
+
+/// Referral — one row per (referrer, invitee) pair.
+/// Status: PENDING → COMPLETED (when invitee makes their first purchase).
+/// On COMPLETED: both referrer + invitee get REFERRAL_BONUS_COINS credited via WalletService.
+model Referral {
+  id              String   @id @default(uuid()) @db.Uuid
+  /// The user who shared the invite code.
+  referrerId      String   @db.Uuid @map("referrer_id")
+  referrer        User     @relation("ReferralReferrer", fields: [referrerId], references: [id], onDelete: Cascade)
+  /// The user who used the invite code (invitee).
+  inviteeId       String   @db.Uuid @map("invitee_id")
+  invitee         User     @relation("ReferralInvitee", fields: [inviteeId], references: [id], onDelete: Cascade)
+  /// Short unique invite code (6-8 chars, alphanumeric).
+  inviteCode      String   @unique @map("invite_code") @db.VarChar(16)
+  /// PENDING → COMPLETED (on invitee's first purchase).
+  status          String   @default("PENDING") @db.VarChar(16)
+  bonusCredited   Boolean  @default(false) @map("bonus_credited")
+  completedAt     DateTime? @map("completed_at")
+  createdAt       DateTime @default(now()) @map("created_at")
+
+  @@unique([referrerId, inviteeId], map: "referral_pair_unique")
+  @@index([inviteeId])
+  @@map("referrals")
+}
+
+// ─────────────────────────────────────────────────────────────────────────────────────
+// ADMIN PANEL
+// ─────────────────────────────────────────────────────────────────────────────────────
+
+/// AdminUser — email+password login for admin panel.
+/// Roles here are MODERATOR | ADMIN (never USER).
+/// Stored separately from User so admins cannot accidentally appear in matchmaking.
+model AdminUser {
+  id            String        @id @default(uuid()) @db.Uuid
+  email         String        @unique @db.VarChar(256)
+  /// bcrypt hash — never log or expose in API responses.
+  passwordHash  String        @map("password_hash") @db.VarChar(128)
+  /// Phase 10: TOTP secret (base32) — ZORUNLU 2FA for admin login.
+  /// Null until the admin sets up 2FA via the first-login flow.
+  totpSecret    String?      @map("totp_secret") @db.VarChar(64)
+  role          AdminRole
+  lastLoginAt   DateTime?     @map("last_login_at")
+  createdAt     DateTime      @default(now()) @map("created_at")
+  updatedAt     DateTime      @updatedAt @map("updated_at")
+
+  auditLogs     AuditLog[]
+  resolvedReports Report[]    @relation("ReportResolver")
+
+  @@index([role])
+  @@map("admin_users")
+}
+
+enum AdminRole {
+  MODERATOR
+  ADMIN
+}
+
+/// AuditLog — append-only record of every admin action.
+/// Used for compliance + post-incident forensics.
+model AuditLog {
+  id            String    @id @default(uuid()) @db.Uuid
+  adminUserId   String    @db.Uuid
+  adminUser     AdminUser @relation(fields: [adminUserId], references: [id], onDelete: Cascade)
+  /// Free-form action name — e.g. "BAN_USER", "REFUND_COINS", "RESOLVE_REPORT".
+  action        String    @db.VarChar(64)
+  /// Polymorphic target — e.g. { type: "User", id: "<uuid>" }
+  targetType    String    @map("target_type") @db.VarChar(32)
+  targetId      String    @map("target_id") @db.Uuid
+  /// Full payload for forensic review (JSON).
+  payload       Json
+  ip            String?   @db.VarChar(45)
+  userAgent     String?   @map("user_agent") @db.VarChar(512)
+  createdAt     DateTime  @default(now()) @map("created_at")
+
+  @@index([adminUserId, createdAt])
+  @@index([targetType, targetId])
+  @@map("audit_logs")
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// HEALTH (Phase 1 only — drop in Phase 2)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Append-only health check audit — keeps the e2e test happy.
+model HealthPing {
+  id        Int      @id @default(autoincrement())
+  source    String   @db.VarChar(64) // "user_app" | "admin_app" | "ci"
+  userId    String?  @db.Uuid // nullable — admin/CI pings have no user
+  user      User?    @relation(fields: [userId], references: [id], onDelete: SetNull)
+  createdAt DateTime @default(now()) @map("created_at")
+
+  @@index([createdAt])
+  @@map("health_pings")
+}
